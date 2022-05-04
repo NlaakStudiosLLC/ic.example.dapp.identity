@@ -1,93 +1,146 @@
 const path = require("path");
 const webpack = require("webpack");
-const HtmlWebpackPlugin = require("html-webpack-plugin");
-const TerserPlugin = require("terser-webpack-plugin");
 const CopyPlugin = require("copy-webpack-plugin");
+const TerserPlugin = require("terser-webpack-plugin");
+const CompressionPlugin = require("compression-webpack-plugin");
+const HttpProxyMiddlware = require("http-proxy-middleware");
+const dfxJson = require("./dfx.json");
+require("dotenv").config();
 
-let canisters;
+/**
+ * Generate a webpack configuration for a canister.
+ */
+function generateWebpackConfigForCanister(name, info) {
+  const isProduction = process.env.NODE_ENV === "production";
+  const devtool = isProduction ? undefined : "source-map";
 
-function initCanisterIds() {
-  if ((dfx_network = process.env.DFX_NETWORK)) {
-    network = dfx_network;
-    console.log(`network was inferred from environment variable DFX_NETWORK`);
-  } else {
-    network = process.env.NODE_ENV === "production" ? "ic" : "local";
-    console.log(
-      `environment variable DFX_NETWORK not set, inferring network from node environment`
-    );
-  }
-
-  network_alphanum = network.replace(/[^a-zA-Z0-9]/g, "_"); // replace non-alphanumeric like dfx
-  console.log(`network is '${network}' (${network_alphanum})`);
-
-  function getCanisterIds(path) {
-    try {
-      return require(path);
-    } catch (error) {
-      console.log(
-        `No canister_ids.json found for network ${network} (${path}), try a different network..`
-      );
-      throw error;
-    }
-  }
-
-  canisters =
-    network === "ic"
-      ? getCanisterIds(path.resolve("canister_ids.json"))
-      : getCanisterIds(
-          path.resolve(".dfx", network_alphanum, "canister_ids.json")
-        );
-
-  for (const canister in canisters) {
-    process.env[canister.toUpperCase() + "_CANISTER_ID"] =
-      canisters[canister][network_alphanum];
-  }
-}
-initCanisterIds();
-
-const index_html = path.join(__dirname, path.join("webapp", "index.html"));
-const index_js = path.join(__dirname, path.join("webapp", "index.js"));
-
-module.exports = {
-  entry: { index: index_js },
-
-  mode: "production",
-
-  output: {
-    filename: "index.js",
-    path: path.join(__dirname, "dist"),
-  },
-
-  plugins: [
-    // This loads index.html as template, and embeds index.js
-    new HtmlWebpackPlugin({
-      template: index_html,
-      cache: false,
-    }),
-
-    new webpack.EnvironmentPlugin({
-      WHOAMI_CANISTER_ID: process.env.WHOAMI_CANISTER_ID,
-      II_CANISTER_ID: process.env.INTERNET_IDENTITY_CANISTER_ID,
-      DFX_NETWORK: process.env.DFX_NETWORK || "local",
-    }),
-    new webpack.ProvidePlugin({
-      Buffer: [require.resolve("buffer/"), "Buffer"],
-      process: require.resolve("process/browser"),
-    }),
-  ],
-
-  // proxy /api to port 8000 during development
-  devServer: {
-    proxy: {
-      "/api": {
-        target: "http://localhost:8000",
-        changeOrigin: true,
-        pathRewrite: {
-          "^/api": "/api",
-        },
+  return {
+    mode: isProduction ? "production" : "development",
+    entry: {
+      index: path.join(__dirname, "src", "frontend", "src", "index"),
+    },
+    devtool,
+    optimization: {
+      minimize: isProduction,
+    },
+    resolve: {
+      extensions: [".js", ".ts", ".jsx", ".tsx"],
+      fallback: {
+        assert: require.resolve("assert/"),
+        buffer: require.resolve("buffer/"),
+        events: require.resolve("events/"),
+        stream: require.resolve("stream-browserify/"),
+        util: require.resolve("util/"),
       },
     },
-    hot: true,
-    static: "./webapp",
-  },
-};
+    output: {
+      filename: "[name].js",
+      path: path.join(__dirname, "dist"),
+    },
+    devServer: {
+
+      // Set up a proxy that redirects API calls and /index.html to the
+      // replica; the rest we serve from here.
+      onBeforeSetupMiddleware: (devServer) => {
+          const dfxJson = './dfx.json';
+          let replicaHost;
+
+          try {
+              replicaHost = require(dfxJson).networks.local.bind;
+          } catch (e) {
+              throw Error(`Could get host from ${dfxJson}: ${e}`);
+          }
+
+          // If the replicaHost lacks protocol (e.g. 'localhost:8000') the
+          // requests are not forwarded properly
+          if(!replicaHost.startsWith("http://")) {
+              replicaHost = `http://${replicaHost}`;
+          }
+
+          const canisterIdsJson = './.dfx/local/canister_ids.json';
+
+          let canisterId;
+
+          try {
+              canisterId = require(canisterIdsJson).internet_identity.local;
+          } catch (e) {
+              throw Error(`Could get canister ID from ${canisterIdsJson}: ${e}`);
+          }
+
+          // basically everything _except_ for index.js, because we want live reload
+          devServer.app.get(['/', '/index.html', '/faq', '/faq', 'about' ], HttpProxyMiddlware.createProxyMiddleware( {
+              target: replicaHost,
+              pathRewrite: (pathAndParams, req) => {
+                  let queryParamsString = `?`;
+
+                  const [path, params] = pathAndParams.split("?");
+
+                  if (params) {
+                      queryParamsString += `${params}&`;
+                  }
+
+                  queryParamsString += `canisterId=${canisterId}`;
+
+                  return path + queryParamsString;
+              },
+
+          }));
+      },
+      port: 8080,
+      proxy: {
+        // Make sure /api calls land on the replica (and not on webpack)
+        "/api": "http://localhost:8000",
+      },
+      allowedHosts: [".localhost", ".local", ".ngrok.io"],
+    },
+
+    // Depending in the language or framework you are using for
+    // front-end development, add module loaders to the default
+    // webpack configuration. For example, if you are using React
+    // modules and CSS as described in the "Adding a stylesheet"
+    // tutorial, uncomment the following lines:
+    module: {
+      rules: [
+        { test: /\.(ts|tsx)$/, loader: "ts-loader" },
+        { test: /\.css$/, use: ["style-loader", "css-loader"] },
+        {
+          test: /\.(png|jpg|gif)$/i,
+          type: "asset/resource",
+        },
+      ],
+    },
+    plugins: [
+      new CopyPlugin({
+        patterns: [
+          {
+            from: path.join(__dirname, "src", "frontend", "assets"),
+            to: path.join(__dirname, "dist"),
+          },
+        ],
+      }),
+      new webpack.ProvidePlugin({
+        Buffer: [require.resolve("buffer/"), "Buffer"],
+        process: require.resolve("process/browser"),
+      }),
+      new webpack.EnvironmentPlugin({
+        "II_FETCH_ROOT_KEY": "0",
+        "II_DUMMY_AUTH": "0",
+        "II_DUMMY_CAPTCHA": "0",
+      }),
+      new CompressionPlugin({
+        test: /\.js(\?.*)?$/i,
+      }),
+      new webpack.IgnorePlugin(/^\.\/wordlists\/(?!english)/, /bip39\/src$/),
+    ],
+  };
+}
+
+// If you have additional webpack configurations you want to build
+//  as part of this configuration, add them to the section below.
+module.exports = [
+  ...Object.entries(dfxJson.canisters)
+    .map(([name, info]) => {
+      return generateWebpackConfigForCanister(name, info);
+    })
+    .filter((x) => !!x),
+];
